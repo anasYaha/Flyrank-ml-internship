@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Detecting Query Cannibalization at FlyRank — A Client-Grouped, Honest-Feature Approach</title>
+<style>
+  :root {
+    --bg: #fafafa;
+    --ink: #1a1a1a;
+    --muted: #6b6b6b;
+    --accent: #2b5cff;
+    --line: #e4e4e4;
+    --card: #ffffff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--ink);
+    line-height: 1.6;
+  }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 64px 24px 96px; }
+  header.title-block { margin-bottom: 48px; }
+  h1 { font-size: 2rem; line-height: 1.25; margin: 0 0 12px; }
+  .subtitle { color: var(--muted); font-size: 1.05rem; margin: 0 0 24px; }
+  .meta { font-size: 0.85rem; color: var(--muted); border-top: 1px solid var(--line); padding-top: 16px; }
+  section { margin-bottom: 48px; }
+  h2 {
+    font-size: 1.3rem;
+    border-bottom: 2px solid var(--ink);
+    padding-bottom: 8px;
+    margin-bottom: 20px;
+  }
+  .todo {
+    background: #fff7e6;
+    border: 1px dashed #e0a100;
+    border-radius: 6px;
+    padding: 12px 16px;
+    font-size: 0.92rem;
+    color: #7a5300;
+  }
+  .todo::before { content: "À COMPLÉTER — "; font-weight: 700; }
+  table { width: 100%; border-collapse: collapse; margin: 16px 0; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); font-size: 0.92rem; }
+  th { color: var(--muted); font-weight: 600; }
+  figure { margin: 24px 0; text-align: center; }
+  figure img { max-width: 100%; border: 1px solid var(--line); border-radius: 6px; }
+  figcaption { font-size: 0.85rem; color: var(--muted); margin-top: 8px; }
+  ol, ul { padding-left: 22px; }
+  code { background: #f0f0f0; padding: 1px 6px; border-radius: 4px; font-size: 0.9em; }
+  a { color: var(--accent); }
+  footer { border-top: 1px solid var(--line); padding-top: 24px; font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="title-block">
+    <h1>Detecting Query Cannibalization at FlyRank</h1>
+    <p class="subtitle">A client-grouped, honest-feature approach — and why a perfect score is a warning sign</p>
+    <div class="meta">
+      Recherche interne · Lane : Cannibalisation de requêtes ·
+      <a href="https://github.com/anasYaha/Flyrank-ml-internship">Repo &amp; reproductibilité</a>
+    </div>
+  </header>
+
+  <section id="abstract">
+    <h2>Abstract</h2>
+    <p>
+      Une même requête de recherche split parfois son trafic entre plusieurs pages d'un même
+      client (cannibalisation), au lieu de se concentrer sur une seule page forte. Nous avons
+      construit un détecteur honnête (features jamais dérivées du label) sur 1&nbsp;129&nbsp;695
+      paires (client, query) issues de 43 clients, évalué sous un split groupé par client
+      (32 clients en train, 11 en test, zéro chevauchement) contre une heuristique simple
+      (volume × nombre de pages concurrentes). Le decision tree et le random forest atteignent
+      un Precision@50&nbsp;=&nbsp;1.00 et un AUC&nbsp;=&nbsp;0.987, contre AUC&nbsp;=&nbsp;0.940 et
+      Precision@50&nbsp;=&nbsp;0.86 pour la baseline. Cette quasi-perfection s'explique surtout par
+      une seule feature dominante (<code>competing_content_count</code>, 91% de l'importance),
+      proche mécaniquement de la définition du label — ce résultat doit donc être lu comme un
+      raffinement modeste de la règle simple, pas une preuve de signal indépendant.
+      Recommandation principale : garder <code>competing_content_count</code> + volume comme
+      premier filtre de priorisation, en traitant le score modèle comme aide à la décision.
+    </p>
+  </section>
+
+  <section id="introduction">
+    <h2>Introduction / Problem statement</h2>
+    <p>
+      Quand plusieurs pages d'un même client se disputent la même requête de recherche,
+      le trafic se fragmente au lieu de se concentrer sur une page forte. Une équipe
+      contenu doit savoir <em>quelles</em> requêtes prioriser pour merger, rediriger ou
+      consolider — traiter toutes les requêtes candidates coûte trop de temps humain.
+    </p>
+    <p>
+      Ce travail construit un détecteur honnête de cannibalisation et compare son
+      classement à une heuristique simple (volume × nombre de pages concurrentes), pour
+      établir si un modèle appris apporte une vraie valeur de priorisation au-delà de la
+      règle simple.
+    </p>
+  </section>
+
+  <section id="data">
+    <h2>Data</h2>
+    <ul>
+      <li>Source : <code>FlyRank/internship-warehouse</code> (Hugging Face, accès géré par token, lecture seule).</li>
+      <li>Tables : <code>fact_content_query_90d</code> (fenêtre glissante 90 jours) jointe à
+        <code>fact_content_daily_performance</code> (mois 2026-03) pour ne garder que le contenu actif en mars.</li>
+      <li>Grain d'analyse : (client_hash_id, query_hash_id) — une ligne par requête par client.</li>
+      <li>Exclusions : aucun nom de client, domaine ou requête brute — uniquement des identifiants
+        hashés et des features agrégées. Les requêtes à contenu unique restent dans le dénominateur
+        (jamais "cannibalisables" par construction, mais pas retirées pour ne pas biaiser le taux de base).</li>
+    </ul>
+    <p>Échantillon final : <strong>1&nbsp;129&nbsp;695</strong> paires (client, query) réparties sur <strong>43 clients</strong>.
+    <span class="todo">Taux de base exact de cannibalisation — à coller depuis la sortie de <code>capstone.ipynb</code> (cellule Data), pas disponible dans le run w05.</span></p>
+  </section>
+
+  <section id="methodology">
+    <h2>Methodology</h2>
+    <ul>
+      <li><strong>Label</strong> — <code>is_cannibalized = top_content_impression_share &lt; 0.70</code>
+        au niveau (client, query).</li>
+      <li><strong>Baseline</strong> — score heuristique = percentile(log impressions) × percentile(nb pages concurrentes), sans apprentissage.</li>
+      <li><strong>Modèles</strong> — Logistic Regression, Decision Tree, Random Forest sur 6 honest features,
+        jamais dérivées de <code>top_content_impression_share</code>.</li>
+      <li><strong>Split</strong> — <code>GroupShuffleSplit</code> sur <code>client_hash_id</code> (test_size=0.25,
+        random_state=42) : aucun client partagé entre train et test, vérifié explicitement.</li>
+      <li><strong>Métriques</strong> — AUC (calibration globale) et Precision@50 (aligné sur l'usage réel :
+        une équipe contenu ne traite qu'un nombre limité de requêtes par cycle).</li>
+    </ul>
+  </section>
+
+  <section id="results">
+    <h2>Results</h2>
+    <p>
+      Split : 708&nbsp;647 lignes / 32 clients en train, 421&nbsp;048 lignes / 11 clients en test,
+      zéro client partagé. Les 3 modèles appris dépassent la baseline sur les deux métriques ;
+      decision_tree et random_forest sont ex-aequo sur Precision@50 (0 faux positif dans leur
+      top-50) — voir Limitations pour pourquoi ce chiffre est à lire avec prudence plutôt que
+      comme une victoire nette.
+    </p>
+    <table>
+      <thead><tr><th>Modèle</th><th>AUC</th><th>Precision@50</th></tr></thead>
+      <tbody>
+        <tr><td>baseline (w04)</td><td>0.940</td><td>0.86</td></tr>
+        <tr><td>logistic_regression</td><td>0.977</td><td>0.96</td></tr>
+        <tr><td>decision_tree</td><td>0.987</td><td>1.00</td></tr>
+        <tr><td>random_forest</td><td>0.987</td><td>1.00</td></tr>
+      </tbody>
+    </table>
+    <figure>
+      <img src="assets/precision_at_50.png" alt="Precision@50 par modèle vs baseline">
+      <figcaption class="todo">Image à générer en exécutant capstone.ipynb (Run All) puis à copier dans paper/assets/.</figcaption>
+    </figure>
+  </section>
+
+  <section id="limitations">
+    <h2>Limitations &amp; honest framing</h2>
+    <ul>
+      <li><strong>Precision@50 = 1.00 est un signal d'alarme autant qu'un résultat.</strong>
+        L'analyse de <code>feature_importances_</code> montre que 91.2% du pouvoir prédictif du
+        decision_tree vient d'une seule feature, <code>competing_content_count</code> (8.6% pour
+        le volume, le reste proche de zéro). Or cette feature est presque mécaniquement liée à la
+        définition du label (<code>is_cannibalized = top_content_impression_share &lt; 0.70</code>) :
+        avec une seule page active sur une query, le top share vaut toujours 1.0, donc jamais
+        cannibalisé. Le modèle apprend en grande partie une relation quasi-déterministe du label
+        plutôt qu'un signal indépendant riche.</li>
+      <li><strong>Scores de confiance grossiers.</strong> Les faux négatifs observés (cannibalisation
+        réelle mais mal scorée) partagent tous exactement le même score (0.198918) avec
+        <code>competing_content_count=2</code> — le decision tree les regroupe dans la même feuille
+        et ne distingue pas entre eux malgré des <code>top_content_impression_share</code> très
+        différents (0.50 à 0.68).</li>
+      <li>Le seuil <code>0.70</code> pour définir <code>is_cannibalized</code> est une convention,
+        pas une vérité terrain — un autre seuil déplacerait le taux de base et les métriques.</li>
+      <li>Corrélation, pas causalité : ce modèle classe des requêtes candidates, il ne prouve pas
+        qu'une action (merge/redirect) améliorera le ranking Google.</li>
+      <li>Fenêtre 90 jours figée sur un seul mois de contenu actif (mars 2026) — pas de validation
+        temporelle inter-mois.</li>
+      <li>Ces résultats sont <strong>observés</strong> sur cet échantillon et <strong>directionnels</strong> —
+        ils orientent une priorisation humaine, ils ne la remplacent pas.</li>
+    </ul>
+  </section>
+
+  <section id="recommendations">
+    <h2>Ranked recommendations</h2>
+    <ol>
+      <li><strong>Filtre de premier passage</strong> — prioriser la revue merge/redirect sur les
+        queries avec <code>competing_content_count &gt;= 2</code> et un volume au-dessus de la
+        médiane : ces deux features portent l'essentiel du pouvoir prédictif observé, un score de
+        modèle plus complexe n'ajoute que peu ici.</li>
+      <li><strong>Ne pas se fier au score seul pour les cas ambigus</strong> — les queries à
+        <code>competing_content_count</code> faible (2-3) et score moyen (~0.2-0.5) sont mal
+        discriminées par le decision tree actuel (feuilles trop grossières) : les envoyer en revue
+        manuelle plutôt qu'en décision automatique.</li>
+      <li><strong>Récolter un signal indépendant du volume/nb de pages</strong> avant la prochaine
+        itération (ex. similarité de structure de titre ou de sujet entre pages concurrentes) — le
+        modèle actuel n'apporte quasiment rien au-delà de ce que l'heuristique simple capte déjà.</li>
+      <li><strong>Valider sur un autre mois</strong> avant déploiement en production — le run actuel
+        porte uniquement sur mars 2026, sans garantie de stabilité temporelle.</li>
+    </ol>
+  </section>
+
+  <section id="reproducibility">
+    <h2>Reproducibility</h2>
+    <ul>
+      <li>Repo : <a href="https://github.com/anasYaha/Flyrank-ml-internship">github.com/anasYaha/Flyrank-ml-internship</a></li>
+      <li>Notebooks : <code>work/notebooks/w03_data_contract.ipynb</code>, <code>w04_baseline_score.ipynb</code>,
+        <code>w04_signal_audit.ipynb</code>, <code>w05_model.ipynb</code>, <code>capstone.ipynb</code>.</li>
+      <li>Données : <code>FlyRank/internship-warehouse</code> sur Hugging Face (accès géré, token lecture seule).</li>
+      <li>Seeds : <code>random_state=42</code> partout pour reproductibilité exacte.</li>
+    </ul>
+  </section>
+
+  <footer>
+    Built on the FlyRank ML Internship dataset — <a href="https://flyrank.ai">flyrank.ai</a>
+  </footer>
+
+</div>
+</body>
+</html>
